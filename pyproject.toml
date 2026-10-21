@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools==75.6.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molgan-tox21-exercise"
+version = "0.1.0"
+description = "MolGAN molecular generation guided by Tox21 toxicity predictions"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "deepchem==2.8.0",
+  "torch==2.5.1",
+  "rdkit==2024.3.5",
+  "numpy==1.26.4",
+  "pandas==2.2.3",
+  "scipy==1.14.1",
+  "scikit-learn==1.5.2",
+  "matplotlib==3.9.2",
+  "joblib==1.4.2",
+  "sympy==1.13.1",
+  "pillow==10.4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.3"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
