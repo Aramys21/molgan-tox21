@@ -1,13 +1,15 @@
 {
   "data": {
-    "raw_file": "data/raw/tox21.csv",
-    "processed_dir": "data/processed"
+    "molnet_cache": "data/deepchem_cache",
+    "audit_file": "data/audit/tox21_molnet_audit.json",
+    "featurizer": "GraphConv",
+    "splitter": "scaffold"
   },
   "artifacts_dir": "artifacts",
   "seed": 42,
   "molgan": {
     "epochs": 100,
-    "generator_steps": 0.2,
+    "generator_steps": 1.0,
     "learning_rate": 0.001,
     "vertices": 9,
     "nodes": 5,
@@ -15,17 +17,72 @@
     "embedding_dim": 10,
     "batch_size": 32
   },
+  "baseline": {
+    "device": "auto",
+    "gradient_penalty": 10.0,
+    "checkpoint_interval": 1000,
+    "max_checkpoints_to_keep": 3,
+    "log_frequency": 100,
+    "learning_rate_decay_rate": 0.9,
+    "learning_rate_decay_steps": 5000,
+    "generation_samples_per_epoch": 64,
+    "smoke_test": {
+      "epochs": 1,
+      "max_molecules": 16,
+      "batch_size": 4,
+      "generator_steps": 1.0,
+      "generation_samples": 16
+    }
+  },
   "toxicity": {
     "fingerprint_size": 2048,
     "fingerprint_radius": 2,
-    "estimators": 100,
-    "test_size": 0.2
+    "estimators": 100
   },
-  "reward": {
-    "toxicity_weight": 1.0,
+  "tox21_predictor": {
+    "endpoint": "NR-AR",
+    "estimator_candidates": [
+      100,
+      300
+    ],
+    "fingerprint_size": 2048,
+    "fingerprint_radius": 2,
+    "bootstrap_samples": 500,
+    "artifacts_dir": "artifacts/tox21_predictors"
+  },
+  "tox21_guided_comparison": {
+    "endpoint": "NR-AR",
     "steps": 100,
     "batch_size": 32,
-    "learning_rate": 0.0001
+    "learning_rate": 0.0001,
+    "sample_count": 128,
+    "out_of_domain_similarity_threshold": 0.25,
+    "diagnostic_thresholds": {
+      "ood_fraction_increase": 0.25,
+      "uncertainty_increase": 0.1,
+      "low_uniqueness_rate": 0.5,
+      "low_tanimoto_distance": 0.2
+    },
+    "settings": [
+      {
+        "name": "activity_focused",
+        "weights": {
+          "activity": 0.7,
+          "diversity": 0.1,
+          "support": 0.1,
+          "uncertainty": 0.1
+        }
+      },
+      {
+        "name": "balanced",
+        "weights": {
+          "activity": 0.4,
+          "diversity": 0.25,
+          "support": 0.2,
+          "uncertainty": 0.15
+        }
+      }
+    ]
   },
   "generation": {
     "candidate_pool": 512,
