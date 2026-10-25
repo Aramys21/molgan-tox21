@@ -5,13 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
-
 from src.data.tox21 import TASKS
 
 
@@ -23,6 +20,7 @@ class Tox21ToxicityPredictor:
     validation_aucs: dict[str, float]
     fingerprint_size: int = 2048
     fingerprint_radius: int = 2
+    training_compounds: int = 0
 
     def __post_init__(self):
         self.fingerprint_generator = rdFingerprintGenerator.GetMorganGenerator(
@@ -63,69 +61,95 @@ class Tox21ToxicityPredictor:
     @classmethod
     def fit(
         cls,
-        frame: pd.DataFrame,
+        train_dataset,
+        validation_dataset=None,
         fingerprint_size: int = 2048,
         fingerprint_radius: int = 2,
         estimators: int = 100,
-        test_size: float = 0.2,
         seed: int = 42,
     ) -> "Tox21ToxicityPredictor":
+        """Fit using only the official training partition.
+
+        Validation labels are used only for ROC-AUC reporting. This method does
+        not accept the test partition, preventing test-label leakage into model
+        fitting or model selection.
+        """
         generator = rdFingerprintGenerator.GetMorganGenerator(
             radius=fingerprint_radius,
             fpSize=fingerprint_size,
         )
-        smiles = frame["smiles"].astype(str).tolist()
+        smiles = [str(smile) for smile in train_dataset.ids]
         valid_indices, x = cls._fingerprints(smiles, generator, fingerprint_size)
         if len(valid_indices) == 0:
             raise ValueError("Aucun SMILES valide pour entraîner les prédicteurs Tox21.")
-        valid_frame = frame.iloc[valid_indices].reset_index(drop=True)
+        train_y = np.asarray(train_dataset.y)
+        train_w = np.asarray(train_dataset.w)
+        if train_y.shape != train_w.shape or train_y.ndim != 2:
+            raise ValueError("Les tableaux y et w d'entraînement doivent avoir forme (n, tâches).")
+        if train_y.shape[1] != len(TASKS):
+            raise ValueError(
+                f"Les données d'entraînement doivent avoir {len(TASKS)} tâches."
+            )
+        train_y = train_y[valid_indices]
+        train_w = train_w[valid_indices]
+
+        validation_x = None
+        validation_y = None
+        validation_w = None
+        if validation_dataset is not None:
+            validation_indices, validation_x = cls._fingerprints(
+                [str(smile) for smile in validation_dataset.ids],
+                generator,
+                fingerprint_size,
+            )
+            validation_y = np.asarray(validation_dataset.y)[validation_indices]
+            validation_w = np.asarray(validation_dataset.w)[validation_indices]
 
         models = {}
         aucs = {}
         for task in TASKS:
-            labels = pd.to_numeric(valid_frame[task], errors="coerce").to_numpy()
-            labeled = np.isfinite(labels)
-            x_task = x[labeled]
-            y_task = labels[labeled].astype(int)
-            if len(np.unique(y_task)) != 2 or np.bincount(y_task, minlength=2).min() < 2:
+            task_index = TASKS.index(task)
+            train_labeled = train_w[:, task_index] > 0
+            y_train = train_y[train_labeled, task_index].astype(int)
+            x_train = x[train_labeled]
+            if (
+                len(np.unique(y_train)) != 2
+                or np.bincount(y_train, minlength=2).min() < 2
+            ):
                 continue
 
-            x_train, x_valid, y_train, y_valid = train_test_split(
-                x_task,
-                y_task,
-                test_size=test_size,
-                random_state=seed,
-                stratify=y_task,
-            )
-            validation_model = RandomForestClassifier(
+            model = RandomForestClassifier(
                 n_estimators=estimators,
                 min_samples_leaf=2,
                 class_weight="balanced_subsample",
                 n_jobs=-1,
                 random_state=seed,
             )
-            validation_model.fit(x_train, y_train)
-            positive_column = int(np.flatnonzero(validation_model.classes_ == 1)[0])
-            aucs[task] = float(
-                roc_auc_score(
-                    y_valid,
-                    validation_model.predict_proba(x_valid)[:, positive_column],
-                )
-            )
-
-            final_model = RandomForestClassifier(
-                n_estimators=estimators,
-                min_samples_leaf=2,
-                class_weight="balanced_subsample",
-                n_jobs=-1,
-                random_state=seed,
-            )
-            final_model.fit(x_task, y_task)
-            models[task] = final_model
+            model.fit(x_train, y_train)
+            models[task] = model
+            if validation_dataset is not None:
+                validation_labeled = validation_w[:, task_index] > 0
+                y_valid = validation_y[validation_labeled, task_index].astype(int)
+                if len(np.unique(y_valid)) == 2:
+                    positive_column = int(np.flatnonzero(model.classes_ == 1)[0])
+                    aucs[task] = float(
+                        roc_auc_score(
+                            y_valid,
+                            model.predict_proba(
+                                validation_x[validation_labeled]
+                            )[:, positive_column],
+                        )
+                    )
 
         if not models:
             raise ValueError("Aucune cible Tox21 ne permet un apprentissage binaire.")
-        return cls(models, aucs, fingerprint_size, fingerprint_radius)
+        return cls(
+            models,
+            aucs,
+            fingerprint_size,
+            fingerprint_radius,
+            len(valid_indices),
+        )
 
     def predict_task_probabilities(self, molecules) -> dict[str, np.ndarray]:
         molecules = list(molecules)
