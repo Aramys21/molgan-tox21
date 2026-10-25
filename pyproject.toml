@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.3"]
+notebook = ["ipykernel==6.29.5"]
 
 [tool.setuptools.packages.find]
 include = ["src*"]
