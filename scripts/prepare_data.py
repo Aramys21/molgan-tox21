@@ -8,25 +8,50 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.data.tox21 import ANALYSIS_FILE, PROCESSED_DIR, RAW_FILE, analyze_and_prepare
+from src.data.tox21 import MOLNET_AUDIT_FILE, MOLNET_CACHE_DIR, load_tox21_splits, write_tox21_audit
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Nettoie et analyse Tox21.")
-    parser.add_argument("--input", type=Path, default=RAW_FILE)
-    parser.add_argument("--output-dir", type=Path, default=PROCESSED_DIR)
+    parser = argparse.ArgumentParser(
+        description="Charge et audite les partitions officielles Tox21 DeepChem."
+    )
+    parser.add_argument("--cache-dir", type=Path, default=MOLNET_CACHE_DIR)
+    parser.add_argument("--audit-file", type=Path, default=MOLNET_AUDIT_FILE)
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Force DeepChem à refaire la featurization et les partitions.",
+    )
     args = parser.parse_args()
 
-    clean, report = analyze_and_prepare(args.input, args.output_dir)
-    report_path = args.output_dir / ANALYSIS_FILE.name
-    print(f"Lignes brutes : {report['raw_rows']}")
-    print(f"Lignes nettoyées : {len(clean)}")
-    print(
-        "Molécules compatibles MolGAN : "
-        f"{report['molgan_filter']['compatible_rows']}"
+    splits = load_tox21_splits(
+        cache_dir=args.cache_dir,
+        featurizer="GraphConv",
+        splitter="scaffold",
+        reload=not args.no_reload,
     )
-    print(f"Rapport : {report_path}")
-    print(json.dumps(report["tasks"], indent=2, ensure_ascii=False))
+    report = write_tox21_audit(splits, args.audit_file)
+    print(
+        f"DeepChem {report['deepchem_version']} | tâches : "
+        f"{', '.join(report['tasks'])}"
+    )
+    print(
+        f"Partitions officielles scaffold: "
+        f"train={len(splits.train)}, valid={len(splits.valid)}, "
+        f"test={len(splits.test)}"
+    )
+    print(
+        f"Features : {report['feature_object_type']} | "
+        f"IDs SMILES : {report['ids']['contains_smiles']}"
+    )
+    print(f"Rapport d'audit : {args.audit_file}")
+    for split_name, stats in report["splits"].items():
+        print(
+            f"{split_name}: {stats['compounds']} composés, "
+            f"{stats['observed_label_cells']} labels observés, "
+            f"{stats['masked_label_cells']} masqués"
+        )
+    print(json.dumps(report["splits"], indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

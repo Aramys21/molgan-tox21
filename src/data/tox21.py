@@ -1,20 +1,19 @@
-"""Load and clean the local Tox21 CSV without changing the source file."""
+"""Load and audit the official MoleculeNet Tox21 partitions."""
 
 from __future__ import annotations
 
 import json
-from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
+import deepchem as dc
+import numpy as np
 import pandas as pd
 from rdkit import Chem
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RAW_FILE = PROJECT_ROOT / "data" / "raw" / "tox21.csv"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-PROCESSED_FILE = PROCESSED_DIR / "tox21_clean.csv"
-MOLGAN_COMPATIBLE_FILE = PROCESSED_DIR / "tox21_molgan_compatible.csv"
-ANALYSIS_FILE = PROCESSED_DIR / "tox21_analysis.json"
+MOLNET_CACHE_DIR = PROJECT_ROOT / "data" / "deepchem_cache"
+MOLNET_AUDIT_FILE = PROJECT_ROOT / "data" / "audit" / "tox21_molnet_audit.json"
 
 TASKS = [
     "NR-AR",
@@ -30,169 +29,211 @@ TASKS = [
     "SR-MMP",
     "SR-p53",
 ]
-MOLGAN_ATOM_NUMBERS = {6, 7, 8, 9}
-MOLGAN_BOND_TYPES = {
-    Chem.BondType.SINGLE,
-    Chem.BondType.DOUBLE,
-    Chem.BondType.TRIPLE,
-    Chem.BondType.AROMATIC,
-}
-MOLGAN_MAX_ATOMS = 9
+@dataclass(frozen=True)
+class Tox21Splits:
+    """Official MoleculeNet Tox21 splits and their loader metadata."""
 
+    tasks: tuple[str, ...]
+    train: dc.data.Dataset
+    valid: dc.data.Dataset
+    test: dc.data.Dataset
+    featurizer: str
+    splitter: str
+    transformers: tuple[str, ...]
+    seed: int | None = None
 
-def _merge_labels(values: pd.Series) -> float:
-    observed = values.dropna().unique()
-    return float(observed[0]) if len(observed) == 1 else float("nan")
+    @property
+    def datasets(self) -> tuple[dc.data.Dataset, dc.data.Dataset, dc.data.Dataset]:
+        return self.train, self.valid, self.test
 
+    def validate(self) -> None:
+        """Raise on malformed labels, arrays, IDs, or split overlap."""
+        if not self.tasks:
+            raise ValueError("Le loader DeepChem n'a retourné aucune tâche.")
+        seen_ids: set[str] = set()
+        for split_name, dataset in zip(
+            ("train", "validation", "test"),
+            self.datasets,
+            strict=True,
+        ):
+            labels = np.asarray(dataset.y)
+            weights = np.asarray(dataset.w)
+            ids = np.asarray(dataset.ids)
+            if labels.ndim != 2 or labels.shape[1] != len(self.tasks):
+                raise ValueError(
+                    f"{split_name}: y attendu de forme (n, {len(self.tasks)}), "
+                    f"reçu {labels.shape}."
+                )
+            if weights.shape != labels.shape:
+                raise ValueError(
+                    f"{split_name}: w de forme {weights.shape}, y de forme "
+                    f"{labels.shape}."
+                )
+            if len(dataset.X) != len(labels) or len(ids) != len(labels):
+                raise ValueError(f"{split_name}: X, y, w et ids ont des tailles différentes.")
+            observed = weights > 0
+            if not np.isin(weights, [0, 1]).all():
+                raise ValueError(
+                    f"{split_name}: les poids attendus sont 0 (masqué) ou 1."
+                )
+            if not np.isin(labels[observed], [0, 1]).all():
+                raise ValueError(
+                    f"{split_name}: labels observés attendus dans {{0, 1}}."
+                )
+            if pd.isna(ids).any():
+                raise ValueError(f"{split_name}: IDs manquants.")
+            split_ids = [str(value) for value in ids]
+            if len(set(split_ids)) != len(split_ids):
+                raise ValueError(f"{split_name}: IDs dupliqués.")
+            overlap = seen_ids.intersection(split_ids)
+            if overlap:
+                raise ValueError(
+                    f"IDs communs entre partitions (ex. {next(iter(overlap))!r})."
+                )
+            seen_ids.update(split_ids)
 
-def _molgan_compatible(smiles: str) -> bool:
-    molecule = Chem.MolFromSmiles(smiles)
-    return bool(
-        molecule is not None
-        and molecule.GetNumAtoms() <= MOLGAN_MAX_ATOMS
-        and all(
-            atom.GetAtomicNum() in MOLGAN_ATOM_NUMBERS
-            for atom in molecule.GetAtoms()
+    def audit(self) -> dict:
+        """Summarize split sizes, SMILES IDs, features, and masked task labels."""
+        self.validate()
+        first_graph = next(
+            (
+                graph
+                for dataset in self.datasets
+                for graph in dataset.X
+                if graph is not None
+            ),
+            None,
         )
-        and all(
-            bond.GetBondType() in MOLGAN_BOND_TYPES
-            for bond in molecule.GetBonds()
-        )
-    )
-
-
-def analyze_and_prepare(
-    raw_file: Path = RAW_FILE,
-    output_dir: Path = PROCESSED_DIR,
-) -> tuple[pd.DataFrame, dict]:
-    """Canonicalize structures, preserve missing labels, and report data quality."""
-    raw_file = Path(raw_file)
-    output_dir = Path(output_dir)
-    if not raw_file.is_file():
-        raise FileNotFoundError(f"Fichier Tox21 introuvable : {raw_file}")
-
-    raw = pd.read_csv(raw_file)
-    required_columns = {"smiles", "mol_id", *TASKS}
-    missing_columns = sorted(required_columns.difference(raw.columns))
-    if missing_columns:
-        raise ValueError(
-            "Colonnes requises absentes : " + ", ".join(missing_columns)
-        )
-
-    report = {
-        "source": str(raw_file),
-        "raw_rows": int(len(raw)),
-        "raw_columns": list(raw.columns),
-        "missing_by_column": {
-            column: int(count) for column, count in raw.isna().sum().items()
-        },
-        "duplicate_full_rows": int(raw.duplicated().sum()),
-        "duplicate_mol_ids": int(raw["mol_id"].duplicated().sum()),
-        "duplicate_smiles_text": int(raw["smiles"].duplicated().sum()),
-    }
-
-    frame = raw.copy()
-    invalid_label_counts = {}
-    for task in TASKS:
-        frame[task] = pd.to_numeric(frame[task], errors="coerce")
-        invalid = frame[task].notna() & ~frame[task].isin([0, 1])
-        invalid_label_counts[task] = int(invalid.sum())
-        frame.loc[invalid, task] = float("nan")
-    report["invalid_label_values_converted_to_missing"] = invalid_label_counts
-
-    canonical_smiles = []
-    invalid_smiles_indices = []
-    for index, value in frame["smiles"].items():
-        smile = str(value).strip() if pd.notna(value) else ""
-        molecule = Chem.MolFromSmiles(smile) if smile else None
-        if molecule is None:
-            invalid_smiles_indices.append(int(index))
-            canonical_smiles.append(None)
-        else:
-            canonical_smiles.append(Chem.MolToSmiles(molecule, canonical=True))
-    frame["smiles"] = canonical_smiles
-    frame = frame.loc[frame["smiles"].notna()].copy()
-    report["invalid_smiles_rows_removed"] = len(invalid_smiles_indices)
-    report["invalid_smiles_source_indices"] = invalid_smiles_indices
-    report["valid_rows_before_structure_deduplication"] = int(len(frame))
-    report["duplicate_canonical_structures"] = int(frame["smiles"].duplicated().sum())
-
-    duplicate_rows = frame.loc[frame["smiles"].duplicated(keep=False)]
-    conflicts = {}
-    for task in TASKS:
-        conflicts[task] = sum(
-            len(group[task].dropna().unique()) > 1
-            for _, group in duplicate_rows.groupby("smiles")
-        )
-    report["duplicate_structure_label_conflicts"] = conflicts
-
-    clean = (
-        frame.groupby("smiles", as_index=False, sort=False)
-        .agg(
-            {
-                "mol_id": "first",
-                **{task: _merge_labels for task in TASKS},
+        sample_ids = [
+            str(value)
+            for dataset in self.datasets
+            for value in dataset.ids[: min(20, len(dataset))]
+        ]
+        parsed_smiles = sum(Chem.MolFromSmiles(smile) is not None for smile in sample_ids)
+        split_stats = {}
+        for split_name, dataset in zip(
+            ("train", "validation", "test"),
+            self.datasets,
+            strict=True,
+        ):
+            labels = np.asarray(dataset.y)
+            observed = np.asarray(dataset.w) > 0
+            task_stats = {}
+            for task_index, task_name in enumerate(self.tasks):
+                task_labels = labels[:, task_index]
+                task_observed = observed[:, task_index]
+                task_stats[task_name] = {
+                    "positive": int(np.sum(task_observed & (task_labels == 1))),
+                    "negative": int(np.sum(task_observed & (task_labels == 0))),
+                    "missing": int(np.sum(~task_observed)),
+                }
+            split_stats[split_name] = {
+                "compounds": int(len(dataset)),
+                "label_cells": int(labels.size),
+                "observed_label_cells": int(observed.sum()),
+                "masked_label_cells": int((~observed).sum()),
+                "tasks": task_stats,
             }
-        )
-        .loc[:, ["mol_id", "smiles", *TASKS]]
-    )
-    report["clean_rows"] = int(len(clean))
-    report["tasks"] = {}
-    for task in TASKS:
-        labels = clean[task]
-        labeled_count = int(labels.notna().sum())
-        report["tasks"][task] = {
-            "positive": int((labels == 1).sum()),
-            "negative": int((labels == 0).sum()),
-            "missing": int(labels.isna().sum()),
-            "positive_rate_among_labeled": (
-                float((labels == 1).sum() / labeled_count)
-                if labeled_count
+        total = sum(split["compounds"] for split in split_stats.values())
+        return {
+            "dataset": "MoleculeNet Tox21 via deepchem.molnet.load_tox21",
+            "deepchem_version": dc.__version__,
+            "tasks": list(self.tasks),
+            "featurizer": self.featurizer,
+            "feature_representation": (
+                f"DeepChem {self.featurizer} molecular graphs"
+            ),
+            "feature_object_type": (
+                f"{type(first_graph).__module__}.{type(first_graph).__name__}"
+                if first_graph is not None
                 else None
             ),
+            "ids": {
+                "field": "Dataset.ids",
+                "contains_smiles": bool(sample_ids)
+                and parsed_smiles == len(sample_ids),
+                "sample_size_checked": len(sample_ids),
+                "sample_smiles_parsed": parsed_smiles,
+            },
+            "splitter": self.splitter,
+            "requested_split_fractions": {
+                "train": 0.8,
+                "validation": 0.1,
+                "test": 0.1,
+            },
+            "split_seed": self.seed,
+            "split_seed_note": (
+                "DeepChem 2.8.0 ScaffoldSplitter sorts scaffold groups and does "
+                "not use its seed argument; the default official loader split is "
+                "preserved."
+                if self.splitter.lower() == "scaffold"
+                else "The official loader's splitter was used."
+            ),
+            "transformers": list(self.transformers),
+            "labels": {
+                "observed_values": [0, 1],
+                "missing_handling": (
+                    "Dataset.y contains label values and may use 0 as a placeholder "
+                    "for missing assays. Dataset.w == 0 masks those entries; "
+                    "Dataset.w == 1 marks observed labels. Metrics and losses must "
+                    "use w and must not treat masked y values as negatives."
+                ),
+            },
+            "total_compounds": total,
+            "splits": split_stats,
         }
 
-    atom_counts = []
-    elements = Counter()
-    for smile in clean["smiles"]:
-        molecule = Chem.MolFromSmiles(smile)
-        if molecule is None:
-            raise ValueError(f"SMILES canonique invalide après nettoyage : {smile}")
-        atom_counts.append(molecule.GetNumHeavyAtoms())
-        elements.update(atom.GetSymbol() for atom in molecule.GetAtoms())
-    report["clean_smiles"] = {
-        "unique_canonical": int(clean["smiles"].nunique()),
-        "heavy_atoms": {
-            "minimum": int(min(atom_counts)) if atom_counts else None,
-            "median": float(pd.Series(atom_counts).median()) if atom_counts else None,
-            "maximum": int(max(atom_counts)) if atom_counts else None,
-        },
-        "element_counts": dict(elements.most_common()),
-    }
 
-    compatible_mask = clean["smiles"].map(_molgan_compatible)
-    compatible = clean.loc[compatible_mask].copy()
-    report["molgan_filter"] = {
-        "maximum_atoms": MOLGAN_MAX_ATOMS,
-        "allowed_elements": ["C", "N", "O", "F"],
-        "compatible_rows": int(len(compatible)),
-        "excluded_rows": int(len(clean) - len(compatible)),
-    }
+def load_tox21_splits(
+    cache_dir: Path = MOLNET_CACHE_DIR,
+    *,
+    featurizer: str = "GraphConv",
+    splitter: str = "scaffold",
+    reload: bool = True,
+) -> Tox21Splits:
+    """Load the official MoleculeNet Tox21 train/validation/test partitions.
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    clean.to_csv(output_dir / PROCESSED_FILE.name, index=False)
-    compatible.to_csv(output_dir / MOLGAN_COMPATIBLE_FILE.name, index=False)
-    (output_dir / ANALYSIS_FILE.name).write_text(
+    DeepChem 2.8.0's loader applies its default 80/10/10 scaffold split. No
+    balancing or other label-transforming transformer is applied so that the
+    original assay labels and missing-label masks remain directly auditable.
+    """
+    cache_dir = Path(cache_dir)
+    tasks, datasets, transformers = dc.molnet.load_tox21(
+        featurizer=featurizer,
+        splitter=splitter,
+        transformers=[],
+        reload=reload,
+        data_dir=str(cache_dir / "raw"),
+        save_dir=str(cache_dir / "processed"),
+    )
+    if len(datasets) != 3:
+        raise ValueError(
+            "Le loader Tox21 doit retourner train, validation et test; "
+            f"il a retourné {len(datasets)} partition(s)."
+        )
+    result = Tox21Splits(
+        tasks=tuple(tasks),
+        train=datasets[0],
+        valid=datasets[1],
+        test=datasets[2],
+        featurizer=featurizer,
+        splitter=splitter,
+        transformers=tuple(type(transformer).__name__ for transformer in transformers),
+    )
+    result.validate()
+    return result
+
+
+def write_tox21_audit(
+    splits: Tox21Splits,
+    output_file: Path = MOLNET_AUDIT_FILE,
+) -> dict:
+    """Write and return the auditable statistics from official DeepChem splits."""
+    report = splits.audit()
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    return clean, report
-
-
-def load_clean_tox21(path: Path = PROCESSED_FILE) -> pd.DataFrame:
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Jeu nettoyé absent : {path}. Lancez `python scripts/prepare_data.py`."
-        )
-    return pd.read_csv(path)
+    return report
